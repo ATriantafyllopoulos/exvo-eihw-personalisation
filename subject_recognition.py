@@ -4,7 +4,6 @@ import numpy as np
 import os
 import pandas as pd
 import random
-import shutil
 import torch
 import tqdm
 import yaml
@@ -94,11 +93,6 @@ if __name__ == '__main__':
         '--seed',
         type=int,
         default=0
-    )
-    parser.add_argument(
-        '--mixup',
-        default=False,
-        action='store_true',
     )
     parser.add_argument(
         '--optimizer',
