@@ -120,7 +120,8 @@ class Cnn14(torch.nn.Module, audobject.Object):
         output_dim: int,
         sigmoid_output: bool = False,
         segmentwise: bool = False,
-        in_channels: int = 1
+        in_channels: int = 1,
+        return_embedding: bool = False
     ):
 
         super().__init__()
@@ -129,6 +130,10 @@ class Cnn14(torch.nn.Module, audobject.Object):
         self.sigmoid_output = sigmoid_output
         self.segmentwise = segmentwise
         self.in_channels = in_channels
+        
+        self.return_embedding = return_embedding
+        if self.return_embedding:
+            self.embedding_dim = 2048
 
         self.bn0 = torch.nn.BatchNorm2d(64)
         self.conv_block1 = ConvBlock(in_channels=in_channels, out_channels=64)
@@ -191,10 +196,12 @@ class Cnn14(torch.nn.Module, audobject.Object):
         return x
 
     def forward(self, x):
-        x = self.get_embedding(x)
-        x = self.out(x)
+        emb = self.get_embedding(x)
+        x = self.out(emb)
         if self.sigmoid_output:
             x = torch.sigmoid(x)
+        if self.return_embedding:
+            return x, emb
         return x
 
 

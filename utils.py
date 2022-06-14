@@ -18,7 +18,9 @@ def evaluate_multitask(
     device, 
     loader,
     task_dict,
-    transfer_func
+    transfer_func,
+    output_dim: int = None,
+    score: bool = True
 ):
     metrics = {
         'classification': {
@@ -37,13 +39,15 @@ def evaluate_multitask(
     model.to(device)
     model.eval()
 
-    outputs = torch.zeros((len(loader.dataset), model.output_dim))
-    targets = torch.zeros((len(loader.dataset), len(task_dict)))
+    outputs = torch.zeros((len(loader.dataset), model.output_dim if output_dim is None else output_dim))
+    if score:
+        targets = torch.zeros((len(loader.dataset), len(task_dict)))
     with torch.no_grad():
         for index, (features, target) in tqdm.tqdm(
             enumerate(loader),
             desc='Batch',
-            total=len(loader)
+            total=len(loader),
+            disable=score
         ):
             start_index = index * loader.batch_size
             end_index = (index + 1) * loader.batch_size
@@ -51,12 +55,14 @@ def evaluate_multitask(
                 end_index = len(loader.dataset)
             outputs[start_index:end_index, :] = model(
                 transfer_func(features, device))
-            targets[start_index:end_index] = target
+            if score:
+                targets[start_index:end_index] = target
             # break
 
-    targets = targets.numpy()
     outputs = outputs.cpu().numpy()
-
+    if not score:
+        return outputs
+    targets = targets.numpy()
     predictions = []
     results = {}
     for task in task_dict:
@@ -81,10 +87,12 @@ def evaluate_multitask(
     emo_score = sum([x for x, y in zip(total_score, task_dict) if y in EMOTIONS]) / len(EMOTIONS)
     if len(task_dict) == len(EMOTIONS):
         total_score = emo_score
+    elif len(task_dict) == 1:
+        total_score = total_score[0]
     else:
         scores = [emo_score] + [x for x, y in zip(total_score, task_dict) if y not in EMOTIONS]
         total_score = len(scores) / sum([1 / (score + 1e-9) for score in scores])
-    
+
     return total_score, results, targets, outputs, predictions
 
 

@@ -9,50 +9,26 @@ import torch
 import tqdm
 import yaml
 
-
+from sklearn.model_selection import train_test_split
 from torch.utils.tensorboard import SummaryWriter
-
-
-from define import (
-    EMOTIONS,
-    TASK_DICT
-)
-
 
 from datasets import (
     CachedDataset,
     WavDataset
 )
-
+from define import (
+    TASK_DICT
+)
 from models import (
     Cnn10,
     Cnn14
 )
-from sincnet import (
-    SincNet,
-    MLP
-)
-from leaf.models.classifier import (
-    Classifier
-)
-from leaf.utilities.data.mixup import (
-    do_mixup, 
-    mixup_criterion
-)
-from leaf.utilities.config_parser import (
-    parse_config, 
-    get_data_info, 
-    get_config
-)
-from losses import (
-    Uncertainty,
-    UncertaintyRevised
-)
+
 from utils import (
     disaggregated_evaluation,
     evaluate_multitask,
     transfer_features,
-    CCCLoss
+    LabelEncoder
 )
 
 
@@ -63,28 +39,8 @@ def fix_index(df, root):
     return df
 
 
-class Model(torch.nn.Module):
-    def __init__(self, cnn, mlp_1, mlp_2, wlen, wshift):
-        super().__init__()
-        self.cnn = cnn
-        self.mlp_1 = mlp_1
-        self.mlp_2 = mlp_2
-        self.wlen = wlen
-        self.wshift = wshift
-        self.output_dim = self.mlp_2.fc_lay[-1]
-
-    def forward(self, x):
-        # x = x.transpose(1, 2)
-        if not self.training:
-            x = x.unfold(1, self.wlen, self.wshift).squeeze(0)
-        out = self.mlp_2(self.mlp_1(self.cnn(x)))
-        if not self.training:
-            out = out.mean(0, keepdim=True)
-        return out    
-
-
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('EXVO Training')
+    parser = argparse.ArgumentParser('EXVO Subject ID Training')
     parser.add_argument(
         '--data-root', 
         help='Path data has been extracted', 
@@ -110,27 +66,9 @@ if __name__ == '__main__':
         help='Optional initial state'
     )
     parser.add_argument(
-        '--approach',
-        default='cnn10',
-        choices=[
-            'cnn14',
-            'cnn10',
-            'sincnet',
-            'leafnet'
-        ]
-    )
-    parser.add_argument(
-        '--task',
-        default='task1',
-        choices=[
-            'task1',
-            'task3'
-        ]
-    )
-    parser.add_argument(
         '--batch-size',
         type=int,
-        default=32,
+        default=8,
         help='Batch size'
     )
     parser.add_argument(
@@ -142,6 +80,15 @@ if __name__ == '__main__':
         '--learning-rate',
         type=float,
         default=0.001
+    )
+    parser.add_argument(
+        '--model',
+        choices=[
+            'CNN5',
+            'cnn10',
+            'cnn14'
+        ],
+        default='CNN5'
     )
     parser.add_argument(
         '--seed',
@@ -159,24 +106,7 @@ if __name__ == '__main__':
         choices=[
             'SGD',
             'Adam',
-            'AdamW',
             'RMSprop'
-        ]
-    )
-    parser.add_argument(
-        '--emo-loss',
-        default='CCC',
-        choices=[
-            'CCC',
-            'MSE',
-        ]
-    )
-    parser.add_argument(
-        '--meishu-loss',
-        default=None,
-        choices=[
-            'uncertainty',
-            'uncertainty-revised'
         ]
     )
     args = parser.parse_args()
@@ -190,14 +120,15 @@ if __name__ == '__main__':
     df = pd.read_csv(os.path.join(args.data_root, 'data_info.csv'))
     df['file'] = df['File_ID'].apply(lambda x: x.strip('[').strip(']') + '.wav')
     df.set_index('file', inplace=True)
-    df_train = df.loc[df['Split'] == 'Train']
-    df_dev = df.loc[df['Split'] == 'Val']
-    df_test = df.loc[df['Split'] == 'Val']
+    df = df.loc[df['Split'] == 'Train']
+    encoder = LabelEncoder(df['Subject_ID'].unique())
+    encoder.to_yaml(os.path.join(experiment_folder, 'encoder.yaml'))
+    df['Subject_ID'] = df['Subject_ID'].apply(encoder.encode)
+
+    df_train, df_dev = train_test_split(df)
+    df_test = df_dev
         
-    if args.task == 'task1':
-        target_column = EMOTIONS + ['Age', 'Country']
-    else:
-        target_column = EMOTIONS
+    target_column = ['Subject_ID']
 
     task_dict = {key: TASK_DICT[key] for key in target_column}
     unit_counter = 0
@@ -211,143 +142,45 @@ if __name__ == '__main__':
             unit_counter += len(df_train[task].unique())
     output_dim = unit_counter
 
-    if args.emo_loss == 'MSE':
-        emo_criterion = torch.nn.MSELoss()
-    elif args.emo_loss == 'CCC':
-        emo_criterion = CCCLoss()
-    if args.task == 'task1':
-        if args.meishu_loss is None:
-            def criterion(pred, true):
-                loss = 0
-                for task_index, task in enumerate(target_column):
-                    if task_dict[task]['type'] == 'classification':
-                        loss += torch.nn.CrossEntropyLoss()(
-                            pred[:, task_dict[task]['unit']],
-                            true[:, task_dict[task]['target']].long()
-                        )
-                    else:
-                        if task in EMOTIONS:
-                            loss += emo_criterion(
-                                pred[:, task_dict[task]['unit']],
-                                true[:, task_dict[task]['target']].float()
-                            )
-                        else:
-                            loss += torch.nn.MSELoss()(
-                                pred[:, task_dict[task]['unit']],
-                                true[:, task_dict[task]['target']].float()
-                            )
-                loss /= len(target_column)
-                return loss
-        else:
-            if args.meishu_loss == 'uncertainty':
-                func = Uncertainty()
-            elif args.meishu_loss == 'uncertainty-revised':
-                func = UncertaintyRevised()
-            else:
-                raise NotImplementedError(args.meishu_loss)
-            def criterion(pred, true):
-                output = [
-                    pred[:, :10],  # emotion
-                    pred[:, 11:],  # country
-                    pred[:, 10],  # age
-                ]
-                emotion = true[:, :10].float()
-                age = true[:, 10].float()
-                country = true[:, 11].long()
-                return func(output, emotion, country, age)
-    else:
-        criterion = emo_criterion
+    criterion = torch.nn.CrossEntropyLoss()
 
     features = pd.read_csv(args.features).set_index('file')
     features['features'] = features['features'].apply(lambda x: os.path.join(os.path.dirname(args.features), os.path.basename(x)))
     
     db_args = {
         'features': features,
-        'target_column': target_column
+        'target_column': 'Subject_ID',
+        'transform': audtorch.transforms.RandomCrop(250, axis=-2)
     }
-    if args.approach == 'cnn14':
-        model = Cnn14(
-            output_dim=output_dim
+    if args.model == 'CNN5':
+        model = torch.nn.Sequential(
+            torch.nn.Conv2d(1, 64, kernel_size=(3, 5), padding=(1, 2)),
+            torch.nn.BatchNorm2d(64),
+            torch.nn.ReLU(),
+            torch.nn.Dropout2d(0.2),
+            torch.nn.Conv2d(64, 256, kernel_size=(3, 5), padding=(1, 2)),
+            torch.nn.BatchNorm2d(256),
+            torch.nn.ReLU(),
+            torch.nn.Dropout2d(0.2),
+            torch.nn.Conv2d(256, 1024, kernel_size=(3, 5), padding=(1, 2)),
+            torch.nn.BatchNorm2d(1024),
+            torch.nn.ReLU(),
+            torch.nn.Dropout2d(0.2),
+            torch.nn.AdaptiveAvgPool2d((1, 1)),
+            torch.nn.Flatten(1, 3),
+            torch.nn.Linear(1024, 1024, bias=True),
+            torch.nn.ReLU(),
+            torch.nn.Linear(1024, output_dim, bias=True)
         )
-        db_class = CachedDataset
-        db_args['transform'] = audtorch.transforms.RandomCrop(250, axis=-2)
-        model.to_yaml(os.path.join(experiment_folder, 'model.yaml'))
-    elif args.approach == 'cnn10':
+    elif args.model == 'cnn10':
         model = Cnn10(
             output_dim=output_dim
         )
-        db_class = CachedDataset
-        db_args['transform'] = audtorch.transforms.RandomCrop(250, axis=-2)
-        model.to_yaml(os.path.join(experiment_folder, 'model.yaml'))
-    elif args.approach == 'sincnet':
-        with open('sincnet.yaml', 'r') as fp:
-            options = yaml.load(fp, Loader=yaml.Loader)
-        
-        feature_config = options['windowing']
-        wlen = int(feature_config['fs'] * feature_config['cw_len'] / 1000.00)
-        wshift = int(feature_config['fs'] * feature_config['cw_shift'] / 1000.00)
-
-        cnn_config = options['cnn']
-        cnn_config['input_dim'] = wlen
-        cnn_config['fs'] = feature_config['fs']
-        cnn = SincNet(cnn_config)
-        
-        mlp_1_config = options['dnn']
-        mlp_1_config['input_dim'] = cnn.out_dim
-        mlp_1 = MLP(mlp_1_config)
-
-        mlp_2_config = options['class']
-        mlp_2_config['input_dim'] = mlp_1_config['fc_lay'][-1]
-        mlp_2 = MLP(mlp_2_config)
-        model = Model(
-            cnn,
-            mlp_1,
-            mlp_2,
-            wlen,
-            wshift
+    elif args.model == 'cnn14':
+        model = Cnn14(
+            output_dim=output_dim
         )
-        x = torch.rand(2, wlen)
-        model.train()
-        x = torch.rand(1, 1600)
-        model.eval()
-        print("EVAL TEST:")
-        print(model(x).shape)
-        print()
-        with open(os.path.join(experiment_folder, 'sincnet.yaml'), 'w') as fp:
-            yaml.dump(options, fp)
-        db_class = WavDataset
-        df_train = fix_index(df_train, args.data_root)
-        df_dev = fix_index(df_dev, args.data_root)
-        df_test = fix_index(df_test, args.data_root)
-        db_args['transform'] = audtorch.transforms.RandomCrop(wlen)
-    elif args.approach == 'leafnet':
-        shutil.copyfile('leaf.cfg', os.path.join(experiment_folder, 'leaf.cfg'))
-        cfg = get_config('leaf.cfg')
-
-        class LeafModel(torch.nn.Module):
-            def __init__(self, model, output_dim: int = 10):
-                super().__init__()
-                self.model = model
-                self.output_dim = output_dim
-            def forward(self, x):
-                return self.model(x)
-        model = LeafModel(Classifier(cfg))
-        db_class = WavDataset
-        df_train = fix_index(df_train, args.data_root)
-        df_dev = fix_index(df_dev, args.data_root)
-        df_test = fix_index(df_test, args.data_root)
-        db_args['transform'] = audtorch.transforms.Compose([
-            lambda x: x.reshape(1, -1),
-            audtorch.transforms.RandomCrop(40000)
-        ])
-        # print(model)
-        # exit()
-        x = torch.rand(1, 1, 44100)
-        model.eval()
-        print("EVAL TEST:")
-        print(model(x).shape)
-        print()
-        # exit()
+    db_class = CachedDataset
 
     if args.state is not None:
         initial_state = torch.load(args.state)
@@ -365,8 +198,6 @@ if __name__ == '__main__':
     print(f'Output shape: {y.shape}')
     # exit()
     db_args.pop('transform')
-    if args.approach == 'leafnet':
-        db_args['transform'] = lambda x: x.reshape(1, -1)
 
     dev_dataset = db_class(
         df_dev,
@@ -384,6 +215,14 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         num_workers=4
     )
+    # x, y = next(iter(train_loader))
+    # model.to(args.device)
+    # model.eval()
+    # print(f'Input shape: {x.shape}')
+    # print(f'Output shape: {y.shape}')
+    # with torch.no_grad():
+    #     print(f'Model shape: {model(x.to(args.device)).shape}')
+    # exit()
 
     dev_loader = torch.utils.data.DataLoader(
         dev_dataset,
@@ -409,8 +248,9 @@ if __name__ == '__main__':
         torch.save(
             model.state_dict(), 
             os.path.join(
-            experiment_folder, 
-            'initial.pth.tar')
+                experiment_folder, 
+                'initial.pth.tar'
+            )
         )
 
         if args.optimizer == 'SGD':
@@ -423,12 +263,6 @@ if __name__ == '__main__':
             optimizer = torch.optim.Adam(
                 model.parameters(),
                 lr=args.learning_rate
-            )
-        elif args.optimizer == 'AdamW':
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.learning_rate,
-                weight_decay=0.0001
             )
         elif args.optimizer == 'RMSprop':
             optimizer = torch.optim.RMSprop(
@@ -462,36 +296,15 @@ if __name__ == '__main__':
             for index, (features, targets) in tqdm.tqdm(
                     enumerate(train_loader), 
                     desc=f'Epoch {epoch}', 
-                    total=len(train_loader),
-                    disable=True
+                    total=len(train_loader)
                 ):
                 
                 if (features != features).sum():
                     raise ValueError(features)
-                if args.mixup:
-                    features = features.to(device)
-                    targets = targets.to(device)
-                    if args.approach in ['cnn10', 'cnn14']:
-                        features = features.squeeze(1)
-                    x, y_a, y_b, lam = do_mixup(
-                        features, 
-                        targets,
-                        mode='multiclass'
-                    )
-                    if args.approach in ['cnn10', 'cnn14']:
-                        x = x.unsqueeze(1)
-                    pred = model(x)
-                    loss = mixup_criterion(
-                        criterion, 
-                        pred, 
-                        y_a, 
-                        y_b, 
-                        lam,
-                    )
-                else:
-                    output = model(transfer_features(features, device))
-                    targets = targets.to(device)
-                    loss = criterion(output, targets)
+                
+                output = model(transfer_features(features, device))
+                targets = targets.to(device)
+                loss = criterion(output, targets)
                 if index % 50 == 0:
                     writer.add_scalar(
                         'train/loss', 
@@ -509,7 +322,8 @@ if __name__ == '__main__':
                 device=device, 
                 loader=dev_loader, 
                 transfer_func=transfer_features,
-                task_dict=task_dict
+                task_dict=task_dict,
+                output_dim=output_dim
             )
             results_df = pd.DataFrame(
                 index=df_dev.index, 
@@ -574,7 +388,8 @@ if __name__ == '__main__':
             device=device, 
             loader=test_loader, 
             transfer_func=transfer_features,
-            task_dict=task_dict
+            task_dict=task_dict,
+            output_dim=output_dim
         )
         results_df = pd.DataFrame(
             index=df_dev.index, 
