@@ -28,22 +28,6 @@ from models import (
     Cnn10,
     Cnn14
 )
-from sincnet import (
-    SincNet,
-    MLP
-)
-from leaf.models.classifier import (
-    Classifier
-)
-from leaf.utilities.data.mixup import (
-    do_mixup, 
-    mixup_criterion
-)
-from leaf.utilities.config_parser import (
-    parse_config, 
-    get_data_info, 
-    get_config
-)
 from losses import (
     Uncertainty,
     UncertaintyRevised
@@ -114,9 +98,7 @@ if __name__ == '__main__':
         default='cnn10',
         choices=[
             'cnn14',
-            'cnn10',
-            'sincnet',
-            'leafnet'
+            'cnn10'
         ]
     )
     parser.add_argument(
@@ -147,11 +129,6 @@ if __name__ == '__main__':
         '--seed',
         type=int,
         default=0
-    )
-    parser.add_argument(
-        '--mixup',
-        default=False,
-        action='store_true',
     )
     parser.add_argument(
         '--optimizer',
@@ -279,75 +256,6 @@ if __name__ == '__main__':
         db_class = CachedDataset
         db_args['transform'] = audtorch.transforms.RandomCrop(250, axis=-2)
         model.to_yaml(os.path.join(experiment_folder, 'model.yaml'))
-    elif args.approach == 'sincnet':
-        with open('sincnet.yaml', 'r') as fp:
-            options = yaml.load(fp, Loader=yaml.Loader)
-        
-        feature_config = options['windowing']
-        wlen = int(feature_config['fs'] * feature_config['cw_len'] / 1000.00)
-        wshift = int(feature_config['fs'] * feature_config['cw_shift'] / 1000.00)
-
-        cnn_config = options['cnn']
-        cnn_config['input_dim'] = wlen
-        cnn_config['fs'] = feature_config['fs']
-        cnn = SincNet(cnn_config)
-        
-        mlp_1_config = options['dnn']
-        mlp_1_config['input_dim'] = cnn.out_dim
-        mlp_1 = MLP(mlp_1_config)
-
-        mlp_2_config = options['class']
-        mlp_2_config['input_dim'] = mlp_1_config['fc_lay'][-1]
-        mlp_2 = MLP(mlp_2_config)
-        model = Model(
-            cnn,
-            mlp_1,
-            mlp_2,
-            wlen,
-            wshift
-        )
-        x = torch.rand(2, wlen)
-        model.train()
-        x = torch.rand(1, 1600)
-        model.eval()
-        print("EVAL TEST:")
-        print(model(x).shape)
-        print()
-        with open(os.path.join(experiment_folder, 'sincnet.yaml'), 'w') as fp:
-            yaml.dump(options, fp)
-        db_class = WavDataset
-        df_train = fix_index(df_train, args.data_root)
-        df_dev = fix_index(df_dev, args.data_root)
-        df_test = fix_index(df_test, args.data_root)
-        db_args['transform'] = audtorch.transforms.RandomCrop(wlen)
-    elif args.approach == 'leafnet':
-        shutil.copyfile('leaf.cfg', os.path.join(experiment_folder, 'leaf.cfg'))
-        cfg = get_config('leaf.cfg')
-
-        class LeafModel(torch.nn.Module):
-            def __init__(self, model, output_dim: int = 10):
-                super().__init__()
-                self.model = model
-                self.output_dim = output_dim
-            def forward(self, x):
-                return self.model(x)
-        model = LeafModel(Classifier(cfg))
-        db_class = WavDataset
-        df_train = fix_index(df_train, args.data_root)
-        df_dev = fix_index(df_dev, args.data_root)
-        df_test = fix_index(df_test, args.data_root)
-        db_args['transform'] = audtorch.transforms.Compose([
-            lambda x: x.reshape(1, -1),
-            audtorch.transforms.RandomCrop(40000)
-        ])
-        # print(model)
-        # exit()
-        x = torch.rand(1, 1, 44100)
-        model.eval()
-        print("EVAL TEST:")
-        print(model(x).shape)
-        print()
-        # exit()
 
     if args.state is not None:
         initial_state = torch.load(args.state)
@@ -468,30 +376,10 @@ if __name__ == '__main__':
                 
                 if (features != features).sum():
                     raise ValueError(features)
-                if args.mixup:
-                    features = features.to(device)
-                    targets = targets.to(device)
-                    if args.approach in ['cnn10', 'cnn14']:
-                        features = features.squeeze(1)
-                    x, y_a, y_b, lam = do_mixup(
-                        features, 
-                        targets,
-                        mode='multiclass'
-                    )
-                    if args.approach in ['cnn10', 'cnn14']:
-                        x = x.unsqueeze(1)
-                    pred = model(x)
-                    loss = mixup_criterion(
-                        criterion, 
-                        pred, 
-                        y_a, 
-                        y_b, 
-                        lam,
-                    )
-                else:
-                    output = model(transfer_features(features, device))
-                    targets = targets.to(device)
-                    loss = criterion(output, targets)
+                
+                output = model(transfer_features(features, device))
+                targets = targets.to(device)
+                loss = criterion(output, targets)
                 if index % 50 == 0:
                     writer.add_scalar(
                         'train/loss', 
