@@ -46,6 +46,10 @@ TASK_DICT = {
     'Country': {
         'type': 'classification',
         'score': 'UAR'
+    },
+    'Subject_ID': {
+        'type': 'classification',
+        'score': 'UAR'
     }
 }
 

@@ -1,4 +1,5 @@
 import argparse
+import audmetric
 import audtorch
 import numpy as np
 import os
@@ -18,36 +19,21 @@ from define import (
     TASK_DICT
 )
 
-
 from datasets import (
-    CachedDataset,
-    WavDataset
+    ConditioningCachedDataset
+)
+
+from exemplar_models import (
+    ExemplarNetwork,
+    FixedEmbeddingCnn14,
+    AttentionFusionCnn14
 )
 
 from models import (
     Cnn10,
     Cnn14
 )
-from sincnet import (
-    SincNet,
-    MLP
-)
-from leaf.models.classifier import (
-    Classifier
-)
-from leaf.utilities.data.mixup import (
-    do_mixup, 
-    mixup_criterion
-)
-from leaf.utilities.config_parser import (
-    parse_config, 
-    get_data_info, 
-    get_config
-)
-from losses import (
-    Uncertainty,
-    UncertaintyRevised
-)
+
 from utils import (
     disaggregated_evaluation,
     evaluate_multitask,
@@ -62,25 +48,85 @@ def fix_index(df, root):
     df.set_index('filename', inplace=True)
     return df
 
+def evaluate_multitask(
+    model,
+    device, 
+    loader,
+    task_dict,
+    transfer_func,
+    score: bool = False
+):
+    metrics = {
+        'classification': {
+            'UAR': audmetric.unweighted_average_recall,
+            'ACC': audmetric.accuracy,
+            'F1': audmetric.unweighted_average_fscore
+        },
+        'regression': {
+            'CC': audmetric.pearson_cc,
+            'CCC': audmetric.concordance_cc,
+            'MSE': audmetric.mean_squared_error,
+            'MAE': audmetric.mean_absolute_error
+        }
+    }
 
-class Model(torch.nn.Module):
-    def __init__(self, cnn, mlp_1, mlp_2, wlen, wshift):
-        super().__init__()
-        self.cnn = cnn
-        self.mlp_1 = mlp_1
-        self.mlp_2 = mlp_2
-        self.wlen = wlen
-        self.wshift = wshift
-        self.output_dim = self.mlp_2.fc_lay[-1]
+    model.to(device)
+    model.eval()
 
-    def forward(self, x):
-        # x = x.transpose(1, 2)
-        if not self.training:
-            x = x.unfold(1, self.wlen, self.wshift).squeeze(0)
-        out = self.mlp_2(self.mlp_1(self.cnn(x)))
-        if not self.training:
-            out = out.mean(0, keepdim=True)
-        return out    
+    outputs = torch.zeros((len(loader.dataset), model.output_dim))
+    if score:
+        targets = torch.zeros((len(loader.dataset), len(task_dict)))
+    with torch.no_grad():
+        for index, (features, target, exemplars, _, _) in tqdm.tqdm(
+            enumerate(loader),
+            desc='Batch',
+            total=len(loader),
+            disable=not score
+        ):
+            start_index = index * loader.batch_size
+            end_index = (index + 1) * loader.batch_size
+            if end_index > len(loader.dataset):
+                end_index = len(loader.dataset)
+            outputs[start_index:end_index, :] = model(
+                (transfer_func(features, device), transfer_func(exemplars, device)))
+            if score:
+                targets[start_index:end_index] = target
+            # break
+
+    outputs = outputs.cpu().numpy()
+    if not score:
+        return _, _, _, outputs, _
+
+    targets = targets.numpy()
+    predictions = []
+    results = {}
+    for task in task_dict:
+        results[task] = {}
+        if task_dict[task]['type'] == 'regression':
+            preds = outputs[:, task_dict[task]['unit']]
+        else:
+            preds = outputs[:, task_dict[task]['unit']].argmax(1)
+        predictions.append(preds)
+        for metric in metrics[task_dict[task]['type']]:
+            results[task][metric] = metrics[task_dict[task]['type']][metric](
+                targets[:, task_dict[task]['target']],
+                preds
+            )
+    predictions = np.stack(predictions).T
+    total_score = []
+    for task in task_dict:
+        score = results[task][task_dict[task]['score']]
+        if task_dict[task]['score'] in ['MAE', 'MSE']:
+            score = 1 / (score + 1e-9)
+        total_score.append(score)
+    emo_score = sum([x for x, y in zip(total_score, task_dict) if y in EMOTIONS]) / len(EMOTIONS)
+    if len(task_dict) == len(EMOTIONS):
+        total_score = emo_score
+    else:
+        scores = [emo_score] + [x for x, y in zip(total_score, task_dict) if y not in EMOTIONS]
+        total_score = len(scores) / sum([1 / (score + 1e-9) for score in scores])
+    
+    return total_score, results, targets, outputs, predictions
 
 
 if __name__ == '__main__':
@@ -114,23 +160,42 @@ if __name__ == '__main__':
         default='cnn10',
         choices=[
             'cnn14',
-            'cnn10',
-            'sincnet',
-            'leafnet'
+            'cnn10'
         ]
     )
     parser.add_argument(
-        '--task',
-        default='task1',
+        '--auxil-net',
+        default='CNN5',
         choices=[
-            'task1',
-            'task3'
+            'CNN5',
+            'cnn10'
         ]
+    )
+    parser.add_argument(
+        '--embedding-norm',
+        default=None,
+        choices=[
+            'LayerNorm',
+            'BatchNorm'
+        ]
+    )
+    parser.add_argument(
+        '--fusion',
+        default='style-transfer',
+        choices=[
+            'style-transfer',
+            'attention'
+        ]
+    )
+    parser.add_argument(
+        '--ignore-auxil',
+        default=False,
+        action='store_true'
     )
     parser.add_argument(
         '--batch-size',
         type=int,
-        default=32,
+        default=8,
         help='Batch size'
     )
     parser.add_argument(
@@ -147,11 +212,6 @@ if __name__ == '__main__':
         '--seed',
         type=int,
         default=0
-    )
-    parser.add_argument(
-        '--mixup',
-        default=False,
-        action='store_true',
     )
     parser.add_argument(
         '--optimizer',
@@ -172,12 +232,31 @@ if __name__ == '__main__':
         ]
     )
     parser.add_argument(
-        '--meishu-loss',
-        default=None,
-        choices=[
-            'uncertainty',
-            'uncertainty-revised'
-        ]
+        '--adversarial',
+        action='store_true',
+        default=False
+    )
+    parser.add_argument(
+        '--skip-softmax',
+        action='store_true',
+        default=False
+    )
+    parser.add_argument(
+        '--multitask',
+        action='store_true',
+        default=False
+    )
+    parser.add_argument(
+        '--auxil-learn-condition',
+        action='store_true',
+        default=False,
+        help='Train auxiliary model to learn condition'
+    )
+    parser.add_argument(
+        '--main-forget-condition',
+        action='store_true',
+        default=False,
+        help='Train main model to forget condition (i.e. adversarial)'
     )
     args = parser.parse_args()
 
@@ -194,10 +273,7 @@ if __name__ == '__main__':
     df_dev = df.loc[df['Split'] == 'Val']
     df_test = df.loc[df['Split'] == 'Val']
         
-    if args.task == 'task1':
-        target_column = EMOTIONS + ['Age', 'Country']
-    else:
-        target_column = EMOTIONS
+    target_column = EMOTIONS
 
     task_dict = {key: TASK_DICT[key] for key in target_column}
     unit_counter = 0
@@ -212,169 +288,113 @@ if __name__ == '__main__':
     output_dim = unit_counter
 
     if args.emo_loss == 'MSE':
-        emo_criterion = torch.nn.MSELoss()
+        criterion = torch.nn.MSELoss()
     elif args.emo_loss == 'CCC':
-        emo_criterion = CCCLoss()
-    if args.task == 'task1':
-        if args.meishu_loss is None:
-            def criterion(pred, true):
-                loss = 0
-                for task_index, task in enumerate(target_column):
-                    if task_dict[task]['type'] == 'classification':
-                        loss += torch.nn.CrossEntropyLoss()(
-                            pred[:, task_dict[task]['unit']],
-                            true[:, task_dict[task]['target']].long()
-                        )
-                    else:
-                        if task in EMOTIONS:
-                            loss += emo_criterion(
-                                pred[:, task_dict[task]['unit']],
-                                true[:, task_dict[task]['target']].float()
-                            )
-                        else:
-                            loss += torch.nn.MSELoss()(
-                                pred[:, task_dict[task]['unit']],
-                                true[:, task_dict[task]['target']].float()
-                            )
-                loss /= len(target_column)
-                return loss
-        else:
-            if args.meishu_loss == 'uncertainty':
-                func = Uncertainty()
-            elif args.meishu_loss == 'uncertainty-revised':
-                func = UncertaintyRevised()
-            else:
-                raise NotImplementedError(args.meishu_loss)
-            def criterion(pred, true):
-                output = [
-                    pred[:, :10],  # emotion
-                    pred[:, 11:],  # country
-                    pred[:, 10],  # age
-                ]
-                emotion = true[:, :10].float()
-                age = true[:, 10].float()
-                country = true[:, 11].long()
-                return func(output, emotion, country, age)
-    else:
-        criterion = emo_criterion
+        criterion = CCCLoss()
 
     features = pd.read_csv(args.features).set_index('file')
-    features['features'] = features['features'].apply(lambda x: os.path.join(os.path.dirname(args.features), os.path.basename(x)))
+    features['features'] = features['features'].apply(
+        lambda x: os.path.join(os.path.dirname(args.features), os.path.basename(x)))
     
     db_args = {
         'features': features,
         'target_column': target_column
     }
     if args.approach == 'cnn14':
-        model = Cnn14(
-            output_dim=output_dim
+        
+        if args.auxil_net == 'CNN5':
+            subnet = torch.nn.Sequential(
+                torch.nn.Conv2d(1, 64, kernel_size=(3, 5), padding=(1, 2)),
+                torch.nn.BatchNorm2d(64),
+                torch.nn.ReLU(),
+                torch.nn.Dropout2d(0.2),
+                torch.nn.Conv2d(64, 256, kernel_size=(3, 5), padding=(1, 2)),
+                torch.nn.BatchNorm2d(256),
+                torch.nn.ReLU(),
+                torch.nn.Dropout2d(0.2),
+                torch.nn.Conv2d(256, 1024, kernel_size=(3, 5), padding=(1, 2)),
+                torch.nn.BatchNorm2d(1024),
+                torch.nn.ReLU(),
+                torch.nn.Dropout2d(0.2),
+                torch.nn.AdaptiveAvgPool2d((1, 1))
+            )
+            embedding_dim = 1024
+        elif args.auxil_net == 'cnn10':
+            class CNN10Auxil(Cnn10):
+                def forward(self, x):
+                    return self.get_embedding(x)
+            subnet = CNN10Auxil(output_dim=output_dim)
+            embedding_dim = 512
+        else:
+            raise NotImplementedError(args.auxil_net)
+        if args.fusion == 'style-transfer':
+            main_net = FixedEmbeddingCnn14(
+                output_dim=output_dim,
+                embedding_dim=embedding_dim
+            )
+        elif args.fusion == 'attention':
+            main_net = AttentionFusionCnn14(
+                output_dim=output_dim,
+                embedding_dim=embedding_dim,
+                norm=args.embedding_norm,
+                softmax=not args.skip_softmax
+            )
+        else:
+            raise NotImplementedError(args.fusion)
+        model = ExemplarNetwork(
+            main_net=Cnn14(output_dim=output_dim, return_embedding=True) if args.ignore_auxil else main_net,
+            subnet=subnet,
+            adversarial_exemplars=args.adversarial,
+            auxil_conditions=len(df_train['Subject_ID'].unique()) if args.auxil_learn_condition else None,
+            main_conditions=len(df_train['Subject_ID'].unique()) if args.main_forget_condition else None,
+            ignore_auxil=args.ignore_auxil
         )
-        db_class = CachedDataset
+        db_class = ConditioningCachedDataset
         db_args['transform'] = audtorch.transforms.RandomCrop(250, axis=-2)
-        model.to_yaml(os.path.join(experiment_folder, 'model.yaml'))
+        # model.to_yaml(os.path.join(experiment_folder, 'model.yaml'))
     elif args.approach == 'cnn10':
-        model = Cnn10(
+        raise NotImplementedError
+        model = FixedEmbeddingCnn14(
             output_dim=output_dim
         )
-        db_class = CachedDataset
+        db_class = ConditioningCachedDataset
         db_args['transform'] = audtorch.transforms.RandomCrop(250, axis=-2)
-        model.to_yaml(os.path.join(experiment_folder, 'model.yaml'))
-    elif args.approach == 'sincnet':
-        with open('sincnet.yaml', 'r') as fp:
-            options = yaml.load(fp, Loader=yaml.Loader)
-        
-        feature_config = options['windowing']
-        wlen = int(feature_config['fs'] * feature_config['cw_len'] / 1000.00)
-        wshift = int(feature_config['fs'] * feature_config['cw_shift'] / 1000.00)
-
-        cnn_config = options['cnn']
-        cnn_config['input_dim'] = wlen
-        cnn_config['fs'] = feature_config['fs']
-        cnn = SincNet(cnn_config)
-        
-        mlp_1_config = options['dnn']
-        mlp_1_config['input_dim'] = cnn.out_dim
-        mlp_1 = MLP(mlp_1_config)
-
-        mlp_2_config = options['class']
-        mlp_2_config['input_dim'] = mlp_1_config['fc_lay'][-1]
-        mlp_2 = MLP(mlp_2_config)
-        model = Model(
-            cnn,
-            mlp_1,
-            mlp_2,
-            wlen,
-            wshift
-        )
-        x = torch.rand(2, wlen)
-        model.train()
-        x = torch.rand(1, 1600)
-        model.eval()
-        print("EVAL TEST:")
-        print(model(x).shape)
-        print()
-        with open(os.path.join(experiment_folder, 'sincnet.yaml'), 'w') as fp:
-            yaml.dump(options, fp)
-        db_class = WavDataset
-        df_train = fix_index(df_train, args.data_root)
-        df_dev = fix_index(df_dev, args.data_root)
-        df_test = fix_index(df_test, args.data_root)
-        db_args['transform'] = audtorch.transforms.RandomCrop(wlen)
-    elif args.approach == 'leafnet':
-        shutil.copyfile('leaf.cfg', os.path.join(experiment_folder, 'leaf.cfg'))
-        cfg = get_config('leaf.cfg')
-
-        class LeafModel(torch.nn.Module):
-            def __init__(self, model, output_dim: int = 10):
-                super().__init__()
-                self.model = model
-                self.output_dim = output_dim
-            def forward(self, x):
-                return self.model(x)
-        model = LeafModel(Classifier(cfg))
-        db_class = WavDataset
-        df_train = fix_index(df_train, args.data_root)
-        df_dev = fix_index(df_dev, args.data_root)
-        df_test = fix_index(df_test, args.data_root)
-        db_args['transform'] = audtorch.transforms.Compose([
-            lambda x: x.reshape(1, -1),
-            audtorch.transforms.RandomCrop(40000)
-        ])
-        # print(model)
-        # exit()
-        x = torch.rand(1, 1, 44100)
-        model.eval()
-        print("EVAL TEST:")
-        print(model(x).shape)
-        print()
-        # exit()
-
+        # model.to_yaml(os.path.join(experiment_folder, 'model.yaml'))
+    
     if args.state is not None:
+        print('Loading old state to continue training...')
         initial_state = torch.load(args.state)
         model.load_state_dict(
             initial_state,
             strict=False
         )
 
+    print(model)
+    print("Starting data loading...")
+    # exit()
     train_dataset = db_class(
         df_train,
         **db_args
     )
-    x, y = train_dataset[0]
+    print('Testing dataset...')
+    x, y, e, et, c = train_dataset[0]
     print(f'Input shape: {x.shape}')
     print(f'Output shape: {y.shape}')
+    print(f'Exemplar shape: {e.shape}')
+    print(f'Exemplar target shape: {et.shape}')
+    print(f'Condition: {c.shape}')
     # exit()
     db_args.pop('transform')
-    if args.approach == 'leafnet':
-        db_args['transform'] = lambda x: x.reshape(1, -1)
 
     dev_dataset = db_class(
         df_dev,
+        mode='evaluation',
         **db_args
     )
 
     test_dataset = db_class(
         df_test,
+        mode='evaluation',
         **db_args
     )
     # create DataLoaders
@@ -382,22 +402,40 @@ if __name__ == '__main__':
         train_dataset,
         shuffle=True,
         batch_size=args.batch_size,
-        num_workers=4
+        num_workers=2
+    )
+
+    print('Testing data loader...')
+    x, y, e, et, c = next(iter(train_loader))
+    print(f'Input shape: {x.shape}')
+    print(f'Output shape: {y.shape}')
+    print(f'Exemplar shape: {e.shape}')
+    print(f'Exemplar target shape: {et.shape}')
+    print(f'Condition shape: {c.shape}')
+
+    # this ensures that whatever reshaping happens
+    # (to run exemplars through encoder)
+    # does not mess up the order of exemplars
+    assert torch.equal(
+        e,
+        e.view(-1, e.shape[2], e.shape[3]).view(e.shape)
     )
 
     dev_loader = torch.utils.data.DataLoader(
         dev_dataset,
         shuffle=False,
         batch_size=1,
-        num_workers=4
+        num_workers=2
     )
 
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         shuffle=False,
         batch_size=1,
-        num_workers=4
+        num_workers=2
     )
+    # print('Finished')
+    # exit()
     device = args.device
     if not os.path.exists(os.path.join(experiment_folder, 'state.pth.tar')):
 
@@ -459,7 +497,7 @@ if __name__ == '__main__':
                 f'Epoch_{epoch+1}'
             )
             os.makedirs(epoch_folder, exist_ok=True)
-            for index, (features, targets) in tqdm.tqdm(
+            for index, (features, targets, exemplars, exemplar_targets, conditions) in tqdm.tqdm(
                     enumerate(train_loader), 
                     desc=f'Epoch {epoch}', 
                     total=len(train_loader),
@@ -468,40 +506,79 @@ if __name__ == '__main__':
                 
                 if (features != features).sum():
                     raise ValueError(features)
-                if args.mixup:
-                    features = features.to(device)
-                    targets = targets.to(device)
-                    if args.approach in ['cnn10', 'cnn14']:
-                        features = features.squeeze(1)
-                    x, y_a, y_b, lam = do_mixup(
-                        features, 
-                        targets,
-                        mode='multiclass'
+                
+                output, exemplar_output = model(
+                    (
+                        transfer_features(features, device),
+                        transfer_features(exemplars, device)
                     )
-                    if args.approach in ['cnn10', 'cnn14']:
-                        x = x.unsqueeze(1)
-                    pred = model(x)
-                    loss = mixup_criterion(
-                        criterion, 
-                        pred, 
-                        y_a, 
-                        y_b, 
-                        lam,
+                )
+                if args.main_forget_condition:
+                    output, condition_output = output
+                    main_auxil_loss = torch.nn.CrossEntropyLoss()(
+                        condition_output, 
+                        conditions.to(device)
                     )
-                else:
-                    output = model(transfer_features(features, device))
-                    targets = targets.to(device)
-                    loss = criterion(output, targets)
+                    writer.add_scalar(
+                        'train/main_auxil_loss', 
+                        main_auxil_loss, 
+                        global_step=epoch * len(train_loader) + index
+                    )
+
+                loss = criterion(output, targets.to(device))
                 if index % 50 == 0:
                     writer.add_scalar(
                         'train/loss', 
                         loss, 
                         global_step=epoch * len(train_loader) + index
                     )
+                if args.main_forget_condition:
+                    loss = (loss + main_auxil_loss) / 2
+
+                if args.multitask:
+                    if args.auxil_learn_condition:
+                        # assumes that network returns a tuple
+                        # with first output being task (i.e. emotion)
+                        # and second output being condition (i.e. speaker ID)
+                        exemplar_condition = exemplar_output[1]
+                        exemplar_output = exemplar_output[0]
+                    exemplar_targets = exemplar_targets.view(-1, targets.shape[1])
+                    exemplar_loss = criterion(exemplar_output, exemplar_targets.to(device))
+                    if index % 50 == 0:
+                        writer.add_scalar(
+                            'train/exemplar_loss', 
+                            exemplar_loss, 
+                            global_step=epoch * len(train_loader) + index
+                        )
+                    if args.auxil_learn_condition:
+                        conditions = torch.repeat_interleave(conditions, 2)
+                        auxil_loss = torch.nn.CrossEntropyLoss()(
+                            exemplar_condition, 
+                            conditions.to(device)
+                        )
+                        writer.add_scalar(
+                            'train/auxil_loss', 
+                            auxil_loss, 
+                            global_step=epoch * len(train_loader) + index
+                        )
+                        # auxil loss starts with values near 6
+                        # exemplar loss is < 1 (as it's a CCC loss)
+                        # auxil_loss was previously multiplied by 0.1
+                        exemplar_loss = (exemplar_loss + auxil_loss) / 2  # TODO: might need balancing
+                    loss = (loss + exemplar_loss) / 2  # TODO: this might require balancing
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                # break
+            # TODO: adversarial loss requires scheduling
+            if args.adversarial or args.main_forget_condition:
+                if epoch < 10:
+                    pass
+                elif epoch < 60:
+                    model.lambd = (epoch - 10) / (50)
+                else:
+                    model.lambd = 1
+                print(f'Lambda scheduling: {model.lambd}')
+            # break
 
             # dev set evaluation
             score, results, targets, outputs, predictions = evaluate_multitask(
