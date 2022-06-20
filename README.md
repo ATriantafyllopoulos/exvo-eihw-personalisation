@@ -1,6 +1,6 @@
 # EXVO
 
-Code to run EXVO experiments.
+Code to run EXVO experiments for https://arxiv.org/abs/2206.06680.
 Code is based on downloading the original data.
 
 First install requirements (preferrably in virtualenv):
